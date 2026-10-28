@@ -1,0 +1,9 @@
+{
+  "name": "block-boost-server",
+  "version": "1.0.0",
+  "description": "Tiny relay that lets Block Boost players see each other online (itch.io copy).",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "ws": "^8.18.0" }
+}

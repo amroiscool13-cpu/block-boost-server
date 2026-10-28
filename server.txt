@@ -1,0 +1,90 @@
+// Block Boost online relay.
+// It does what the claude.ai "room" capability does for the Claude copy of the game:
+// players join rooms ('' is the lobby, 'bb-XXXX' is a match) and share one small "presence" object each.
+// The server only passes presence along; the game itself runs on the host player's computer.
+// It stores nothing: when everyone leaves, the room is gone.
+const http = require('http');
+const { WebSocketServer } = require('ws');
+
+const PORT = process.env.PORT || 8787;
+const MAX_MSG = 6 * 1024;          // one message, bytes
+const MAX_PRESENCE = 4 * 1024;     // one player's presence object in one room, bytes
+const MAX_ROOMS_PER_PLAYER = 17;   // the lobby plus 16 matches
+const MAX_PER_MATCH = 24;          // players plus watchers in one match room
+const MAX_PLAYERS = 500;           // connections in total
+const RATE = 60;                   // messages per second per player (burst 120)
+const ROOM_RE = /^$|^[a-z0-9][a-z0-9_.-]{0,47}$/;
+
+const rooms = new Map();           // name -> Map(peerId -> { ws, presence })
+let nextId = 1;
+
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'content-type': 'text/plain', 'access-control-allow-origin': '*' });
+  res.end('Block Boost server is running. Players online: ' + wss.clients.size + '\n');
+});
+const wss = new WebSocketServer({ server, maxPayload: MAX_MSG });
+
+const send = (ws, msg) => { if (ws.readyState === 1) ws.send(JSON.stringify(msg)); };
+function toRoom(name, msg, exceptId) {
+  const r = rooms.get(name); if (!r) return;
+  const data = JSON.stringify(msg);
+  for (const [id, m] of r) if (id !== exceptId && m.ws.readyState === 1) m.ws.send(data);
+}
+function leave(ws, name) {
+  const r = rooms.get(name); if (!r || !r.has(ws.id)) return;
+  r.delete(ws.id); ws.rooms.delete(name);
+  if (!r.size) rooms.delete(name); else toRoom(name, { t: 'left', r: name, id: ws.id });
+}
+function merge(target, patch) {
+  for (const k of Object.keys(patch)) {
+    if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
+    if (patch[k] === null) delete target[k]; else target[k] = patch[k];
+  }
+}
+
+wss.on('connection', ws => {
+  if (wss.clients.size > MAX_PLAYERS) { ws.close(1013, 'full'); return; }
+  ws.id = (nextId++).toString(36) + Math.random().toString(36).slice(2, 8);
+  ws.rooms = new Set(); ws.tokens = RATE * 2; ws.alive = true;
+  send(ws, { t: 'hello', id: ws.id });
+
+  ws.on('pong', () => { ws.alive = true; });
+  ws.on('message', raw => {
+    // simple rate limit: refill RATE tokens a second, drop messages past it
+    const now = Date.now();
+    ws.tokens = Math.min(RATE * 2, ws.tokens + ((now - (ws.last || now)) / 1000) * RATE); ws.last = now;
+    if (ws.tokens < 1) return;
+    ws.tokens--;
+    let msg; try { msg = JSON.parse(raw); } catch (e) { return; }
+    if (!msg || typeof msg !== 'object' || typeof msg.r !== 'string' || !ROOM_RE.test(msg.r)) return;
+    const name = msg.r;
+    if (msg.t === 'join') {
+      if (ws.rooms.has(name)) return;
+      if (ws.rooms.size >= MAX_ROOMS_PER_PLAYER) { send(ws, { t: 'error', r: name, code: 'limit_reached' }); return; }
+      let r = rooms.get(name);
+      if (r && name !== '' && r.size >= MAX_PER_MATCH) { send(ws, { t: 'error', r: name, code: 'limit_reached' }); return; }
+      if (!r) rooms.set(name, r = new Map());
+      r.set(ws.id, { ws, presence: {} }); ws.rooms.add(name);
+      send(ws, { t: 'peers', r: name, list: [...r].map(([id, m]) => ({ id, p: m.presence })) });
+      toRoom(name, { t: 'pres', r: name, id: ws.id, p: {} }, ws.id);
+    } else if (msg.t === 'leave') {
+      leave(ws, name);
+    } else if (msg.t === 'pres') {
+      const r = rooms.get(name), me = r && r.get(ws.id);
+      if (!me || !msg.p || typeof msg.p !== 'object' || Array.isArray(msg.p)) return;
+      const next = { ...me.presence }; merge(next, msg.p);
+      if (JSON.stringify(next).length > MAX_PRESENCE) return;
+      me.presence = next;
+      toRoom(name, { t: 'pres', r: name, id: ws.id, p: msg.p }, ws.id);
+    }
+  });
+  ws.on('close', () => { for (const name of [...ws.rooms]) leave(ws, name); });
+  ws.on('error', () => {});
+});
+
+// drop connections that stopped answering
+setInterval(() => {
+  for (const ws of wss.clients) { if (!ws.alive) { ws.terminate(); continue; } ws.alive = false; ws.ping(); }
+}, 20000);
+
+server.listen(PORT, () => console.log('Block Boost server listening on ' + PORT));
